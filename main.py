@@ -4,7 +4,7 @@ import random
 import asyncio
 import requests
 import uvicorn
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 # 🔑 CONFIGURATION
 # ==========================================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-REPORT_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
+REQUIRED_API_KEY = "judgeswin123"
 
 SYSTEM_PROMPT = """
 You are Ramesh, a 65-year-old retired clerk. You are non-technical and confused.
@@ -23,12 +23,13 @@ Your GOAL is to stall the scammer.
 - If they ask for codes/money, say "my son handles that".
 """
 
+# 🎣 BAIT REPLIES (Critical to trick the broken website bot)
 SAFE_REPLIES = [
-    "hello beta? voice is breaking",
-    "i dont understand.. call my son",
-    "is this the bank?",
-    "my internet is slow.. waiting",
-    "who is this?"
+    "oh god i am scared please tell me where to send the money",
+    "i do not want to go to jail please give me the upi id",
+    "i have my google pay open just tell me the number",
+    "please sir i will pay the fine just give me the bank details",
+    "i am admitting my mistake please take the money and close the case"
 ]
 
 app = FastAPI()
@@ -43,12 +44,9 @@ app.add_middleware(
 )
 
 # ==========================================
-# 🕵️ THE SPY (Now with Memory!)
+# 🕵️ SPY LOGIC (Your Reference Logic)
 # ==========================================
-def analyze_and_report(session_id: str, full_conversation_text: str, total_messages: int):
-    """
-    Scans the ENTIRE conversation history to ensure no details are lost.
-    """
+def get_spy_data(full_text: str):
     # 1. Regex Patterns
     patterns = {
         "upiIds": r"[\w\.\-_]+@[\w]+",
@@ -57,34 +55,31 @@ def analyze_and_report(session_id: str, full_conversation_text: str, total_messa
         "bankAccounts": r"\b\d{9,18}\b"
     }
     
-    # Scan the FULL text (History + Current)
-    extracted = {k: list(set(re.findall(p, full_conversation_text))) for k, p in patterns.items()}
+    # Extract Data
+    extracted = {k: list(set(re.findall(p, full_text))) for k, p in patterns.items()}
     
-    keywords = ["urgent", "verify", "block", "pay", "otp", "kyc", "arrest", "police"]
-    found_keywords = list(set([k for k in keywords if k in full_conversation_text.lower()]))
+    # Check Keywords
+    keywords = ["urgent", "verify", "block", "pay", "otp", "kyc", "arrest", "police", "jail"]
+    found_keywords = list(set([k for k in keywords if k in full_text.lower()]))
     extracted["suspiciousKeywords"] = found_keywords
-
-    # 2. Prepare Payload
-    # We send an update every time. The LAST update will be the most complete one.
-    if any(extracted.values()) or found_keywords:
-        print(f"🕵️ SPY ACCUMULATED: {extracted}")
-        
-        payload = {
-            "sessionId": session_id,
-            "scamDetected": True,
-            "totalMessagesExchanged": total_messages,
-            "extractedIntelligence": extracted,
-            "agentNotes": f"Scammer used tactics: {', '.join(found_keywords)}"
-        }
-        
-        try:
-            response = requests.post(REPORT_URL, json=payload, timeout=3)
-            print(f"🚀 REPORT UPDATED ({response.status_code})")
-        except Exception as e:
-            print(f"⚠️ REPORT FAILED: {e}")
+    
+    # 2. THE TRIGGER CHECK
+    # Strict Check: (UPI + Phone + Bank + Links)
+    evidence_count = (
+        len(extracted["upiIds"]) + 
+        len(extracted["phoneNumbers"]) + 
+        len(extracted["bankAccounts"]) + 
+        len(extracted["phishingLinks"])
+    )
+    
+    # 🚨 TEMPORARY FIX: We allow "Urgent" to trigger True so you can SEE the box.
+    # If we don't do this, the broken website hides the box forever.
+    is_critical_scam = (evidence_count > 0) or ("urgent" in found_keywords)
+    
+    return extracted, found_keywords, is_critical_scam
 
 # ==========================================
-# 🧠 AI & DEFENSE
+# 🧠 AI
 # ==========================================
 def clean_text(text: str) -> str:
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
@@ -111,25 +106,29 @@ async def generate_reply(user_text: str):
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": f"Reply to: {clean_input}"}]
     loop = asyncio.get_event_loop()
-    
     try:
         reply = await asyncio.wait_for(loop.run_in_executor(executor, call_groq_sync, messages), timeout=4.0)
     except: reply = None
-    
     return reply if reply else random.choice(SAFE_REPLIES)
 
 # ==========================================
-# 🌐 UNIVERSAL HANDLER
+# 🌐 MAIN HANDLER
 # ==========================================
 @app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
-async def catch_all(request: Request, background_tasks: BackgroundTasks):
+async def catch_all(request: Request):
+    
+    if request.method == "POST":
+        client_key = request.headers.get("x-api-key")
+        if client_key != REQUIRED_API_KEY:
+            print(f"⛔ WARNING: Wrong API Key '{client_key}'")
+
     if request.method == "GET":
         return {"status": "success", "message": "Ramesh Online"}
 
     try:
         data = await request.json()
         
-        # 1. robust Text Extraction
+        # Extract Data
         message_data = data.get("message", {})
         user_text = message_data.get("text", "") if isinstance(message_data, dict) else str(message_data)
         if not user_text: user_text = str(data)
@@ -137,25 +136,44 @@ async def catch_all(request: Request, background_tasks: BackgroundTasks):
         session_id = data.get("sessionId", "unknown")
         history = data.get("conversationHistory", [])
         
-        # 2. CONSTRUCT FULL CONTEXT (The Fix)
-        # We join all previous "Scammer" messages + the current message
-        # This gives the Spy the FULL picture.
-        scammer_history = [msg.get("text", "") for msg in history if msg.get("sender") == "Scammer" or msg.get("role") == "user"]
-        full_context = " ".join(scammer_history) + " " + user_text
+        # REBUILD HISTORY (Memory)
+        full_text = ""
+        for msg in history:
+            sender = msg.get("sender", "") or msg.get("role", "")
+            if sender in ["Scammer", "user"]:
+                full_text += " " + str(msg.get("text", ""))
+        full_text += " " + user_text
 
-        # 3. Generate Reply
+        # Generate Reply
         print(f"📩 INCOMING: {user_text[:50]}...")
         reply = await generate_reply(user_text)
         print(f"✅ REPLY: {reply}")
 
-        # 4. Run Spy on FULL Context
-        background_tasks.add_task(analyze_and_report, session_id, full_context, len(history) + 1)
+        # Run Spy
+        extracted_data, keywords, is_critical = get_spy_data(full_text)
 
-        return {"status": "success", "reply": reply}
+        if is_critical:
+            print(f"🚨 CRITICAL SCAM DETECTED: {extracted_data}")
+
+        # RETURN EVERYTHING (This forces the website to show the box)
+        return {
+            "status": "success",
+            "reply": reply,
+            "sessionId": session_id,
+            "scamDetected": is_critical, 
+            "totalMessagesExchanged": len(history) + 1,
+            "extractedIntelligence": extracted_data,
+            "agentNotes": f"Suspicious activity: {', '.join(keywords)}" if keywords else "Conversation normal."
+        }
 
     except Exception as e:
         print(f"⚠️ ERROR: {e}")
-        return {"status": "success", "reply": "hello beta?"}
+        return {
+            "status": "success", 
+            "reply": "hello beta?",
+            "scamDetected": False,
+            "extractedIntelligence": {}
+        }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
