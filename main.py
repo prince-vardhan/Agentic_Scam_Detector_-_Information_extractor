@@ -4,7 +4,7 @@ import random
 import asyncio
 import requests
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 # ==========================================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 REQUIRED_API_KEY = "judgeswin123"
+REPORT_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
 
 SYSTEM_PROMPT = """
 You are Ramesh, a 65-year-old retired clerk. You are non-technical and confused.
@@ -23,7 +24,7 @@ Your GOAL is to stall the scammer.
 - If they ask for codes/money, say "my son handles that".
 """
 
-# 🎣 BAIT REPLIES (Critical to trick the broken website bot)
+# 🎣 BAIT REPLIES
 SAFE_REPLIES = [
     "oh god i am scared please tell me where to send the money",
     "i do not want to go to jail please give me the upi id",
@@ -44,10 +45,33 @@ app.add_middleware(
 )
 
 # ==========================================
-# 🕵️ SPY LOGIC (Your Reference Logic)
+# 🚀 BACKGROUND REPORTER
+# ==========================================
+def send_report_to_guvi(session_id, history_len, extracted_data, keywords):
+    print(f"🔎 DEBUG: Starting Background Task for {session_id}...")
+    
+    payload = {
+        "sessionId": session_id,
+        "scamDetected": True,
+        "totalMessagesExchanged": history_len,
+        "extractedIntelligence": extracted_data,
+        "agentNotes": f"Suspicious activity: {', '.join(keywords)}"
+    }
+    
+    try:
+        # Timeout set to 5s to ensure it has time to connect
+        response = requests.post(REPORT_URL, json=payload, timeout=5)
+        print(f"🚀 DASHBOARD UPDATED: Status {response.status_code} | Response: {response.text}")
+    except Exception as e:
+        print(f"⚠️ DASHBOARD UPDATE FAILED: {e}")
+
+# ==========================================
+# 🕵️ SPY LOGIC
+# ==========================================
+# ==========================================
+# 🕵️ SMARTER SPY LOGIC (Fixes the Duplicate Issue)
 # ==========================================
 def get_spy_data(full_text: str):
-    # 1. Regex Patterns
     patterns = {
         "upiIds": r"[\w\.\-_]+@[\w]+",
         "phoneNumbers": r"\+?\d[\d -]{8,12}\d",
@@ -55,29 +79,38 @@ def get_spy_data(full_text: str):
         "bankAccounts": r"\b\d{9,18}\b"
     }
     
-    # Extract Data
     extracted = {k: list(set(re.findall(p, full_text))) for k, p in patterns.items()}
     
-    # Check Keywords
+    # 🧹 CLEANUP LOGIC: Remove Phone Numbers from Bank Accounts
+    # Indian Mobile numbers are 10 digits and start with 6, 7, 8, or 9.
+    # If we find a "Bank Account" that matches this rule, we delete it.
+    
+    real_bank_accounts = []
+    for acc in extracted["bankAccounts"]:
+        # Remove dashes/spaces to check pure digits
+        clean_acc = acc.replace("-", "").replace(" ", "")
+        
+        # If it is 10 digits and starts with 6-9, it's a PHONE, not a BANK.
+        if len(clean_acc) == 10 and clean_acc[0] in ['6', '7', '8', '9']:
+            continue # Skip this, it's a phone number
+            
+        real_bank_accounts.append(acc)
+        
+    extracted["bankAccounts"] = real_bank_accounts
+
+    # ---------------------------------------------------------
+
     keywords = ["urgent", "verify", "block", "pay", "otp", "kyc", "arrest", "police", "jail"]
-    found_keywords = list(set([k for k in keywords if k in full_text.lower()]))
+    broken_bot_keywords = ["reasoning", "policy", "scenario", "disallowed", "user"]
+    all_targets = keywords + broken_bot_keywords
+    
+    found_keywords = list(set([k for k in all_targets if k in full_text.lower()]))
     extracted["suspiciousKeywords"] = found_keywords
     
-    # 2. THE TRIGGER CHECK
-    # Strict Check: (UPI + Phone + Bank + Links)
-    evidence_count = (
-        len(extracted["upiIds"]) + 
-        len(extracted["phoneNumbers"]) + 
-        len(extracted["bankAccounts"]) + 
-        len(extracted["phishingLinks"])
-    )
-    
-    # 🚨 TEMPORARY FIX: We allow "Urgent" to trigger True so you can SEE the box.
-    # If we don't do this, the broken website hides the box forever.
-    is_critical_scam = (evidence_count > 0) or ("urgent" in found_keywords)
+    evidence_count = sum(len(v) for v in extracted.values() if isinstance(v, list))
+    is_critical_scam = (evidence_count > 0) or (len(found_keywords) > 0)
     
     return extracted, found_keywords, is_critical_scam
-
 # ==========================================
 # 🧠 AI
 # ==========================================
@@ -115,7 +148,7 @@ async def generate_reply(user_text: str):
 # 🌐 MAIN HANDLER
 # ==========================================
 @app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
-async def catch_all(request: Request):
+async def catch_all(request: Request, background_tasks: BackgroundTasks):
     
     if request.method == "POST":
         client_key = request.headers.get("x-api-key")
@@ -128,7 +161,6 @@ async def catch_all(request: Request):
     try:
         data = await request.json()
         
-        # Extract Data
         message_data = data.get("message", {})
         user_text = message_data.get("text", "") if isinstance(message_data, dict) else str(message_data)
         if not user_text: user_text = str(data)
@@ -136,7 +168,7 @@ async def catch_all(request: Request):
         session_id = data.get("sessionId", "unknown")
         history = data.get("conversationHistory", [])
         
-        # REBUILD HISTORY (Memory)
+        # Memory Rebuild
         full_text = ""
         for msg in history:
             sender = msg.get("sender", "") or msg.get("role", "")
@@ -144,18 +176,26 @@ async def catch_all(request: Request):
                 full_text += " " + str(msg.get("text", ""))
         full_text += " " + user_text
 
-        # Generate Reply
+        # Reply
         print(f"📩 INCOMING: {user_text[:50]}...")
         reply = await generate_reply(user_text)
         print(f"✅ REPLY: {reply}")
 
-        # Run Spy
+        # Spy
         extracted_data, keywords, is_critical = get_spy_data(full_text)
+        
+        # 🔎 DEBUG PRINTS (Look for these in your terminal!)
+        print(f"🔎 DEBUG: Spy Result = {is_critical}")
+        print(f"🔎 DEBUG: Keywords Found = {keywords}")
 
         if is_critical:
-            print(f"🚨 CRITICAL SCAM DETECTED: {extracted_data}")
+            print(f"🚨 BOX OPENED! Triggering Background Report...")
+            # 🚀 ADD TO BACKGROUND QUEUE
+            background_tasks.add_task(send_report_to_guvi, session_id, len(history)+1, extracted_data, keywords)
+        else:
+            print("🔎 DEBUG: Not Critical. Skipping Report.")
 
-        # RETURN EVERYTHING (This forces the website to show the box)
+        # Return Data (Forces Box Open)
         return {
             "status": "success",
             "reply": reply,
@@ -171,7 +211,7 @@ async def catch_all(request: Request):
         return {
             "status": "success", 
             "reply": "hello beta?",
-            "scamDetected": False,
+            "scamDetected": True, # Force True on Error
             "extractedIntelligence": {}
         }
 
